@@ -10,6 +10,7 @@ use options::{PagefindInboundConfig, SearchOptions};
 use output::SyntheticFile;
 use rayon::prelude::*;
 pub use service::api;
+use service::api::IndexedFileResponse;
 use wax::walk::Entry;
 use wax::Glob;
 
@@ -34,6 +35,8 @@ const PAGEFIND_VERSION: &str = env!("CARGO_PKG_VERSION");
 struct SearchState {
     options: SearchOptions,
     fossicked_pages: Vec<FossickedData>,
+    /// The position in `fossicked_pages` of the first page with each URL.
+    page_positions: HashMap<String, usize>,
     built_indexes: Vec<PagefindIndexes>,
 }
 
@@ -42,6 +45,7 @@ impl SearchState {
         Self {
             options,
             fossicked_pages: vec![],
+            page_positions: HashMap::new(),
             built_indexes: vec![],
         }
     }
@@ -109,6 +113,16 @@ impl SearchState {
 
         let existing_page_count = self.fossicked_pages.len();
         self.fossicked_pages.extend(results);
+        for (position, page) in self
+            .fossicked_pages
+            .iter()
+            .enumerate()
+            .skip(existing_page_count)
+        {
+            self.page_positions
+                .entry_ref(page.url.as_str())
+                .or_insert(position);
+        }
 
         Ok(self.fossicked_pages.len() - existing_page_count)
     }
@@ -116,17 +130,40 @@ impl SearchState {
     pub fn fossick_one(&mut self, file: Fossicker) -> Result<FossickedData> {
         let result = file.fossick_sync(&self.options);
         if let Some(result) = result.as_ref().ok() {
-            let existing = self
-                .fossicked_pages
-                .iter()
-                .position(|page| page.url == result.url);
-            if let Some(existing) = existing {
-                *self.fossicked_pages.get_mut(existing).unwrap() = result.clone();
-            } else {
-                self.fossicked_pages.push(result.clone());
-            }
+            self.add_page(result.clone());
         }
         result
+    }
+
+    /// Fossick files in parallel using rayon, then add them in the given order,
+    /// as calling `fossick_one` for each file in turn would.
+    /// If any file fails, no file is added, and the first error in the given order is returned.
+    pub fn fossick_batch(&mut self, files: Vec<Fossicker>) -> Result<Vec<IndexedFileResponse>> {
+        let results: Vec<_> = files
+            .into_par_iter()
+            .map(|f| f.fossick_sync(&self.options))
+            .collect();
+        let pages = results.into_iter().collect::<Result<Vec<_>>>()?;
+
+        Ok(pages
+            .into_iter()
+            .map(|page| {
+                let response = IndexedFileResponse::describe(&page);
+                self.add_page(page);
+                response
+            })
+            .collect())
+    }
+
+    /// Add a page, replacing the page already added with the same URL at its position.
+    fn add_page(&mut self, page: FossickedData) {
+        if let Some(&existing) = self.page_positions.get(page.url.as_str()) {
+            self.fossicked_pages[existing] = page;
+        } else {
+            self.page_positions
+                .insert(page.url.clone(), self.fossicked_pages.len());
+            self.fossicked_pages.push(page);
+        }
     }
 
     pub async fn build_indexes(&mut self) -> Result<()> {

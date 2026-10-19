@@ -39,7 +39,7 @@ use rust_patch::Patch;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use crate::{
-    fossick::{parser::DomParserResult, Fossicker},
+    fossick::{parser::DomParserResult, FossickedData, Fossicker},
     options::PagefindServiceConfig,
     PagefindInboundConfig, SearchOptions, SearchState,
 };
@@ -49,6 +49,28 @@ pub struct IndexedFileResponse {
     pub page_word_count: u32,
     pub page_url: String,
     pub page_meta: BTreeMap<String, String>,
+}
+
+impl IndexedFileResponse {
+    pub(crate) fn describe(page: &FossickedData) -> Self {
+        Self {
+            page_word_count: page.fragment.data.word_count as u32,
+            page_url: page.fragment.data.url.clone(),
+            page_meta: page.fragment.data.meta.clone(),
+        }
+    }
+}
+
+/// An HTML file that isn't on disk, for [`PagefindIndex::add_html_files`].
+/// Either a `source_path` or a `url` must be provided.
+#[derive(Debug, Clone)]
+pub struct HtmlFile {
+    /// The source path of the HTML file if it were to exist on disk.
+    pub source_path: Option<String>,
+    /// An explicit URL to use, instead of having Pagefind compute the URL based on the `source_path`.
+    pub url: Option<String>,
+    /// The source HTML content of the file to be parsed.
+    pub content: String,
 }
 
 pub struct PagefindIndex {
@@ -111,6 +133,48 @@ impl PagefindIndex {
             page_url: data.fragment.data.url,
             page_meta: data.fragment.data.meta,
         })
+    }
+
+    /// Add a batch of HTML files that aren't on disk into this search index.
+    /// The files are parsed in parallel, then added in the given order, so the
+    /// index is the same as one built by calling [`PagefindIndex::add_html_file`]
+    /// for each file in turn. A file whose URL was already added replaces that
+    /// page, keeping its original position.
+    ///
+    /// The batch is added as a whole: if any file has neither a `source_path`
+    /// nor a `url`, or fails to parse, no file of the batch is added, and the
+    /// error of the first such file in the given order is returned.
+    ///
+    /// # Arguments
+    /// * `files` - The files to add, each with a source path, a URL, or both.
+    ///
+    /// # Returns
+    /// Metadata about each added file, in the given order, if successful, otherwise an Error.
+    pub async fn add_html_files(
+        &mut self,
+        files: Vec<HtmlFile>,
+    ) -> Result<Vec<IndexedFileResponse>> {
+        if let Some(position) = files
+            .iter()
+            .position(|file| file.source_path.is_none() && file.url.is_none())
+        {
+            bail!("Either source_path or url must be provided (the file at index {position})");
+        }
+
+        let files: Vec<_> = files
+            .into_iter()
+            .map(|file| {
+                Fossicker::new_synthetic(
+                    file.source_path.map(PathBuf::from),
+                    file.url,
+                    file.content,
+                )
+            })
+            .collect();
+        let state = Arc::clone(&self.search_index);
+        tokio::task::spawn_blocking(move || state.blocking_lock().fossick_batch(files))
+            .await
+            .map_err(|e| anyhow::anyhow!("Task join error: {e}"))?
     }
 
     /// Index a custom record that isn't backed by an HTML file.
@@ -265,5 +329,200 @@ mod tests {
         assert!(filenames
             .iter()
             .any(|f| f.to_string_lossy().ends_with(".pf_index")));
+    }
+
+    fn test_index() -> PagefindIndex {
+        let options = PagefindServiceConfig::builder()
+            .keep_index_url(true)
+            .force_language("en".to_string())
+            .build();
+        PagefindIndex::new(Some(options)).unwrap()
+    }
+
+    fn html_file(source_path: Option<&str>, url: Option<&str>, content: &str) -> HtmlFile {
+        HtmlFile {
+            source_path: source_path.map(Into::into),
+            url: url.map(Into::into),
+            content: content.into(),
+        }
+    }
+
+    /// Pages with headings, metadata, weights, and filters; `/alpha/` is given twice.
+    /// They use one filter value only: the values of a filter are encoded in hash map
+    /// order, so two values would make two builds of the same pages differ.
+    fn test_pages() -> Vec<HtmlFile> {
+        vec![
+            html_file(
+                None,
+                Some("/alpha/"),
+                "<html lang=\"en\"><body><h1>Alpha</h1><p>The first page about apples.</p>\
+                 <h2 id=\"orchards\">Orchards</h2><p>Apples grow in orchards.</p></body></html>",
+            ),
+            html_file(
+                None,
+                Some("/beta/"),
+                "<html lang=\"en\"><body><h1 data-pagefind-meta=\"title\">Beta guide</h1>\
+                 <span data-pagefind-meta=\"author:Ann\"></span>\
+                 <p data-pagefind-weight=\"5\">Bananas matter most here.</p>\
+                 <p data-pagefind-filter=\"kind\">guide</p></body></html>",
+            ),
+            html_file(
+                Some("docs/gamma.html"),
+                None,
+                "<html lang=\"en\"><body><h1>Gamma</h1><h2 id=\"cherries\">Cherries</h2>\
+                 <p data-pagefind-weight=\"0.5\">Cherries are small.</p></body></html>",
+            ),
+            html_file(
+                Some("docs/delta.html"),
+                Some("/delta/"),
+                "<html lang=\"en\"><body><h1>Delta</h1><p>Dates and figs.</p>\
+                 <h3 id=\"figs\">Figs</h3><p>Figs are sweet.</p>\
+                 <p data-pagefind-filter=\"kind\">guide</p></body></html>",
+            ),
+            html_file(
+                None,
+                Some("/alpha/"),
+                "<html lang=\"en\"><body><h1>Alpha again</h1><p>The second page about apricots.</p>\
+                 </body></html>",
+            ),
+            html_file(
+                None,
+                Some("/epsilon/"),
+                "<html lang=\"en\"><body><h1 data-pagefind-meta=\"title\">Epsilon</h1>\
+                 <img data-pagefind-meta=\"image[src]\" src=\"/e.png\">\
+                 <p>Elderberries, apples, and bananas.</p></body></html>",
+            ),
+        ]
+    }
+
+    fn sorted_files(files: Vec<SyntheticFile>) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<_> = files
+            .into_iter()
+            .map(|f| (f.filename, f.contents))
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn describe(response: &IndexedFileResponse) -> (u32, String, BTreeMap<String, String>) {
+        (
+            response.page_word_count,
+            response.page_url.clone(),
+            response.page_meta.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn adding_a_batch_of_files_builds_the_files_adding_them_one_by_one_builds() {
+        let mut one_by_one = test_index();
+        let mut one_by_one_responses = vec![];
+        for file in test_pages() {
+            let response = one_by_one
+                .add_html_file(file.source_path, file.url, file.content)
+                .await
+                .expect("Adding a file should succeed");
+            one_by_one_responses.push(describe(&response));
+        }
+
+        let mut batch = test_index();
+        let batch_responses = batch
+            .add_html_files(test_pages())
+            .await
+            .expect("Adding a batch should succeed");
+
+        assert_eq!(
+            batch_responses.iter().map(describe).collect::<Vec<_>>(),
+            one_by_one_responses
+        );
+        assert_eq!(
+            sorted_files(batch.get_files().await.unwrap()),
+            sorted_files(one_by_one.get_files().await.unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_url_keeps_its_first_position_and_takes_the_later_content() {
+        let mut index = test_index();
+        index
+            .add_html_file(
+                None,
+                Some("/alpha/".into()),
+                "<html><body><p>Apples first.</p></body></html>".into(),
+            )
+            .await
+            .unwrap();
+
+        let responses = index
+            .add_html_files(vec![
+                html_file(
+                    None,
+                    Some("/beta/"),
+                    "<html><body><p>Bananas first.</p></body></html>",
+                ),
+                html_file(
+                    None,
+                    Some("/alpha/"),
+                    "<html><body><p>Apricots later.</p></body></html>",
+                ),
+                html_file(
+                    None,
+                    Some("/beta/"),
+                    "<html><body><p>Blueberries later still.</p></body></html>",
+                ),
+            ])
+            .await
+            .unwrap();
+
+        // Each response describes the file it was given for.
+        assert_eq!(
+            responses
+                .iter()
+                .map(describe)
+                .map(|d| (d.0, d.1))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, "/beta/".to_string()),
+                (2, "/alpha/".to_string()),
+                (3, "/beta/".to_string()),
+            ]
+        );
+
+        let state = index.search_index.lock().await;
+        let pages: Vec<_> = state
+            .fossicked_pages
+            .iter()
+            .map(|p| (p.url.as_str(), p.fragment.data.content.as_str()))
+            .collect();
+        assert_eq!(
+            pages,
+            vec![
+                ("/alpha/", "Apricots later."),
+                ("/beta/", "Blueberries later still."),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_a_file_without_a_path_or_url_adds_no_file() {
+        let mut index = test_index();
+        let result = index
+            .add_html_files(vec![
+                html_file(
+                    None,
+                    Some("/alpha/"),
+                    "<html><body><p>Apples.</p></body></html>",
+                ),
+                html_file(None, None, "<html><body><p>Nowhere.</p></body></html>"),
+                html_file(
+                    None,
+                    Some("/beta/"),
+                    "<html><body><p>Bananas.</p></body></html>",
+                ),
+            ])
+            .await;
+
+        let error = result.expect_err("A file without a path or URL should fail the batch");
+        assert!(error.to_string().contains("index 1"), "{error}");
+        assert!(index.search_index.lock().await.fossicked_pages.is_empty());
     }
 }
