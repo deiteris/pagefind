@@ -10,6 +10,7 @@ use futures::future::join_all;
 use hashbrown::HashMap;
 use include_dir::{include_dir, Dir};
 use minifier::js::minify;
+use rayon::prelude::*;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
@@ -156,67 +157,67 @@ async fn write_common(
     };
 
     let mut files = vec![
-        write(
+        OutputFile::new(
             outdir.join("pagefind.js"),
             vec![&js],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-highlight.js"),
             vec![HIGHLIGHT_JS],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-worker.js"),
             vec![&worker_js],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-ui.js"),
             vec![WEB_UI_JS],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-ui.css"),
             vec![WEB_UI_CSS],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-modular-ui.js"),
             vec![WEB_MODULAR_UI_JS],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-modular-ui.css"),
             vec![WEB_MODULAR_UI_CSS],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-component-ui.js"),
             vec![COMPONENT_UI_JS],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-component-ui.css"),
             vec![COMPONENT_UI_CSS],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("wasm.unknown.pagefind"),
             vec![GENERIC_WEB_WASM],
             Compress::None,
             write_behavior,
         ),
-        write(
+        OutputFile::new(
             outdir.join("pagefind-entry.json"),
             vec![encoded_entry_meta.as_bytes()],
             Compress::None,
@@ -226,19 +227,19 @@ async fn write_common(
 
     if output_playground {
         files.extend([
-            write(
+            OutputFile::new(
                 outdir.join("playground/index.html"),
                 vec![crate::playground::PLAYGROUND_HTML.as_bytes()],
                 Compress::None,
                 write_behavior,
             ),
-            write(
+            OutputFile::new(
                 outdir.join("playground/pagefind-playground.js"),
                 vec![crate::playground::PLAYGROUND_JS.as_bytes()],
                 Compress::None,
                 write_behavior,
             ),
-            write(
+            OutputFile::new(
                 outdir.join("playground/pagefind-playground.css"),
                 vec![crate::playground::PLAYGROUND_CSS.as_bytes()],
                 Compress::None,
@@ -247,10 +248,10 @@ async fn write_common(
         ]);
     }
 
-    let output_files = join_all(files).await;
+    let output_files = write_all(files).await;
 
     if synthetic {
-        Some(output_files.into_iter().flatten().collect())
+        Some(output_files)
     } else {
         None
     }
@@ -319,7 +320,7 @@ impl PagefindIndexes {
             WriteBehavior::Immutable
         };
 
-        let mut files = vec![write(
+        let mut files = vec![OutputFile::new(
             outdir.join(format!("pagefind.{}.pf_meta", &self.meta_index.0)),
             vec![&self.meta_index.1],
             Compress::GZ,
@@ -328,7 +329,7 @@ impl PagefindIndexes {
 
         if self.language != "unknown" {
             if let Some(wasm_path) = self.lang_wasm_path() {
-                files.push(write(
+                files.push(OutputFile::new(
                     outdir.join(format!("wasm.{}.pagefind", self.language)),
                     vec![WEB_WASM_FILES
                         .get_file(wasm_path)
@@ -351,7 +352,7 @@ impl PagefindIndexes {
         }
 
         files.extend(self.fragments.iter().map(|(hash, fragment)| {
-            write(
+            OutputFile::new(
                 outdir.join(format!("fragment/{}.pf_fragment", hash)),
                 vec![fragment.as_bytes()],
                 Compress::GZ,
@@ -360,7 +361,7 @@ impl PagefindIndexes {
         }));
 
         files.extend(self.word_indexes.iter().map(|(hash, index)| {
-            write(
+            OutputFile::new(
                 outdir.join(format!("index/{}.pf_index", hash)),
                 vec![index],
                 Compress::GZ,
@@ -369,7 +370,7 @@ impl PagefindIndexes {
         }));
 
         files.extend(self.filter_indexes.iter().map(|(hash, index)| {
-            write(
+            OutputFile::new(
                 outdir.join(format!("filter/{}.pf_filter", hash)),
                 vec![index],
                 Compress::GZ,
@@ -377,9 +378,9 @@ impl PagefindIndexes {
             )
         }));
 
-        let output_files = join_all(files).await;
+        let output_files = write_all(files).await;
         if synthetic {
-            Some(output_files.into_iter().flatten().collect())
+            Some(output_files)
         } else {
             None
         }
@@ -405,60 +406,197 @@ pub struct SyntheticFile {
     pub contents: Vec<u8>,
 }
 
-async fn write(
+/// A file of the bundle, before it is compressed and written.
+struct OutputFile<'a> {
     filename: PathBuf,
-    content_chunks: Vec<&[u8]>,
+    content_chunks: Vec<&'a [u8]>,
     compression: Compress,
     write_behavior: WriteBehavior,
-) -> Option<SyntheticFile> {
-    let mut file = None;
+}
 
-    match write_behavior {
-        WriteBehavior::Synthetic => {}
+/// A file of the bundle with its final contents, ready to be written.
+struct EncodedFile<'a> {
+    filename: PathBuf,
+    contents: Contents<'a>,
+    write_behavior: WriteBehavior,
+}
+
+enum Contents<'a> {
+    Compressed(Vec<u8>),
+    Uncompressed(Vec<&'a [u8]>),
+}
+
+impl<'a> OutputFile<'a> {
+    fn new(
+        filename: PathBuf,
+        content_chunks: Vec<&'a [u8]>,
+        compression: Compress,
+        write_behavior: WriteBehavior,
+    ) -> Self {
+        Self {
+            filename,
+            content_chunks,
+            compression,
+            write_behavior,
+        }
+    }
+
+    /// Compress this file's contents if needed, or return `None` if it shouldn't be written.
+    fn encode(self) -> Option<EncodedFile<'a>> {
         // For "immutable" (hashed) files, don't re-write them as the contents _should_ be unchanged.
-        WriteBehavior::Immutable if filename.exists() => return None,
-        WriteBehavior::Immutable | WriteBehavior::Disk => {
-            if let Some(parent) = filename.parent() {
-                create_dir_all(parent).await.unwrap();
-            }
+        if matches!(self.write_behavior, WriteBehavior::Immutable) && self.filename.exists() {
+            return None;
+        }
 
-            let mut output_file = File::create(&filename).await;
-            while output_file.is_err() {
-                sleep(Duration::from_millis(100)).await;
-                output_file = File::create(&filename).await;
+        let contents = match self.compression {
+            Compress::GZ => {
+                let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+                for chunk in self.content_chunks {
+                    gz.write_all(b"pagefind_dcd").unwrap();
+                    gz.write_all(chunk).unwrap();
+                }
+                Contents::Compressed(gz.finish().ok()?)
             }
-            file = output_file.ok();
-        }
-    };
+            Compress::None => Contents::Uncompressed(self.content_chunks),
+        };
 
-    match compression {
-        Compress::GZ => {
-            let mut gz = GzEncoder::new(Vec::new(), Compression::best());
-            for chunk in content_chunks {
-                gz.write_all(b"pagefind_dcd").unwrap();
-                gz.write_all(chunk).unwrap();
+        Some(EncodedFile {
+            filename: self.filename,
+            contents,
+            write_behavior: self.write_behavior,
+        })
+    }
+}
+
+/// Compress the files in parallel, then write them, or return them in order if synthetic.
+async fn write_all(files: Vec<OutputFile<'_>>) -> Vec<SyntheticFile> {
+    let encoded: Vec<_> = files
+        .into_par_iter()
+        .filter_map(OutputFile::encode)
+        .collect();
+
+    join_all(encoded.into_iter().map(write))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+async fn write(file: EncodedFile<'_>) -> Option<SyntheticFile> {
+    let EncodedFile {
+        filename,
+        contents,
+        write_behavior,
+    } = file;
+
+    if matches!(write_behavior, WriteBehavior::Synthetic) {
+        let contents = match contents {
+            Contents::Compressed(contents) => contents,
+            Contents::Uncompressed(chunks) => chunks.into_iter().flatten().cloned().collect(),
+        };
+        return Some(SyntheticFile { filename, contents });
+    }
+
+    if let Some(parent) = filename.parent() {
+        create_dir_all(parent).await.unwrap();
+    }
+
+    let mut output_file = File::create(&filename).await;
+    while output_file.is_err() {
+        sleep(Duration::from_millis(100)).await;
+        output_file = File::create(&filename).await;
+    }
+    let mut file = output_file.unwrap();
+
+    match contents {
+        Contents::Compressed(contents) => file.write_all(&contents).await.unwrap(),
+        Contents::Uncompressed(chunks) => {
+            for chunk in chunks {
+                file.write_all(chunk).await.unwrap();
             }
-            if let Ok(contents) = gz.finish() {
-                if let Some(mut file) = file {
-                    file.write_all(&contents).await.unwrap();
-                } else {
-                    return Some(SyntheticFile { filename, contents });
-                }
-            }
-            None
         }
-        Compress::None => {
-            if let Some(mut file) = file {
-                for chunk in content_chunks {
-                    file.write_all(chunk).await.unwrap();
-                }
-                None
-            } else {
-                return Some(SyntheticFile {
-                    filename,
-                    contents: content_chunks.into_iter().flatten().cloned().collect(),
-                });
-            }
-        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        let mut decoded = vec![];
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut decoded)
+            .expect("The contents should be gzipped");
+        decoded
+    }
+
+    fn chunks() -> Vec<&'static [u8]> {
+        vec![b"first", b"second"]
+    }
+
+    #[test]
+    fn a_compressed_file_decodes_to_the_prefix_before_each_chunk() {
+        let file = OutputFile::new(
+            PathBuf::from("a.pf_fragment"),
+            chunks(),
+            Compress::GZ,
+            WriteBehavior::Synthetic,
+        );
+        let Some(EncodedFile {
+            contents: Contents::Compressed(contents),
+            ..
+        }) = file.encode()
+        else {
+            panic!("The file should be compressed");
+        };
+        assert_eq!(gunzip(&contents), b"pagefind_dcdfirstpagefind_dcdsecond");
+    }
+
+    #[test]
+    fn an_uncompressed_file_keeps_its_chunks() {
+        let file = OutputFile::new(
+            PathBuf::from("a.js"),
+            chunks(),
+            Compress::None,
+            WriteBehavior::Synthetic,
+        );
+        let Some(EncodedFile {
+            contents: Contents::Uncompressed(contents),
+            ..
+        }) = file.encode()
+        else {
+            panic!("The file should not be compressed");
+        };
+        assert_eq!(contents, chunks());
+    }
+
+    #[tokio::test]
+    async fn synthetic_files_are_returned_in_the_given_order() {
+        let files = write_all(vec![
+            OutputFile::new(
+                PathBuf::from("b.pf_index"),
+                chunks(),
+                Compress::GZ,
+                WriteBehavior::Synthetic,
+            ),
+            OutputFile::new(
+                PathBuf::from("a.js"),
+                chunks(),
+                Compress::None,
+                WriteBehavior::Synthetic,
+            ),
+        ])
+        .await;
+
+        let files: Vec<_> = files
+            .into_iter()
+            .map(|f| (f.filename, f.contents))
+            .collect();
+        assert_eq!(files[0].0, PathBuf::from("b.pf_index"));
+        assert_eq!(gunzip(&files[0].1), b"pagefind_dcdfirstpagefind_dcdsecond");
+        assert_eq!(files[1], (PathBuf::from("a.js"), b"firstsecond".to_vec()));
+        assert_eq!(files.len(), 2);
     }
 }
