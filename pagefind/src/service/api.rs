@@ -525,4 +525,93 @@ mod tests {
         assert!(error.to_string().contains("index 1"), "{error}");
         assert!(index.search_index.lock().await.fossicked_pages.is_empty());
     }
+
+    /// The SHA-1 of the name and decoded contents of each gzipped file of a bundle,
+    /// in name order, and the number of those files.
+    fn decoded_digest(files: Vec<(String, Vec<u8>)>) -> (String, usize) {
+        use sha1::{Digest, Sha1};
+        use std::io::Read;
+
+        let mut files: Vec<_> = files
+            .into_iter()
+            .map(|(name, contents)| (name.replace('\\', "/"), contents))
+            .filter(|(name, _)| {
+                [".pf_meta", ".pf_fragment", ".pf_index", ".pf_filter"]
+                    .iter()
+                    .any(|extension| name.ends_with(extension))
+            })
+            .collect();
+        files.sort();
+
+        let mut hasher = Sha1::new();
+        for (name, contents) in &files {
+            let mut decoded = vec![];
+            flate2::read::GzDecoder::new(&contents[..])
+                .read_to_end(&mut decoded)
+                .unwrap_or_else(|e| panic!("{name} should be gzipped: {e}"));
+            assert!(decoded.starts_with(b"pagefind_dcd"), "{name}");
+            hasher.update(name.as_bytes());
+            hasher.update(&decoded);
+        }
+        (format!("{:x}", hasher.finalize()), files.len())
+    }
+
+    /// The meta file, a fragment for each of the five distinct URLs, the word
+    /// index chunk, and the filter.
+    const DECODED_BUNDLE: (&str, usize) = ("67fbefe001a52c4a460f2d81b86e6fc2cd555093", 8);
+
+    #[tokio::test]
+    async fn the_gzipped_files_of_a_bundle_in_memory_decode_to_the_same_payloads() {
+        let mut index = test_index();
+        index.add_html_files(test_pages()).await.unwrap();
+        let files = index
+            .get_files()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.filename.to_string_lossy().into_owned(), f.contents))
+            .collect();
+
+        let (digest, count) = decoded_digest(files);
+        assert_eq!((digest.as_str(), count), DECODED_BUNDLE);
+    }
+
+    #[tokio::test]
+    async fn the_gzipped_files_of_a_bundle_on_disk_decode_to_the_same_payloads() {
+        fn read_tree(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            files: &mut Vec<(String, Vec<u8>)>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    read_tree(root, &path, files);
+                } else {
+                    let name = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    files.push((name, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+
+        let outdir =
+            std::env::temp_dir().join(format!("pagefind-bundle-test-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&outdir);
+        let mut index = test_index();
+        index.add_html_files(test_pages()).await.unwrap();
+        index
+            .write_files(Some(outdir.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        let mut files = vec![];
+        read_tree(&outdir, &outdir, &mut files);
+        std::fs::remove_dir_all(&outdir).unwrap();
+
+        let (digest, count) = decoded_digest(files);
+        assert_eq!((digest.as_str(), count), DECODED_BUNDLE);
+    }
 }
