@@ -526,17 +526,21 @@ mod tests {
         assert!(index.search_index.lock().await.fossicked_pages.is_empty());
     }
 
-    /// The SHA-1 of the name and decoded contents of each gzipped file of a bundle,
-    /// in name order, and the number of those files.
-    fn decoded_digest(files: Vec<(String, Vec<u8>)>) -> (String, usize) {
+    fn file_name(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    /// The SHA-1 of the name and decoded contents of each gzipped file of a bundle
+    /// but the meta file, in name order, and the number of those files.
+    /// The meta file is left out because it records the Pagefind version.
+    fn decoded_digest(files: &[(String, Vec<u8>)]) -> (String, usize) {
         use sha1::{Digest, Sha1};
         use std::io::Read;
 
         let mut files: Vec<_> = files
-            .into_iter()
-            .map(|(name, contents)| (name.replace('\\', "/"), contents))
+            .iter()
             .filter(|(name, _)| {
-                [".pf_meta", ".pf_fragment", ".pf_index", ".pf_filter"]
+                [".pf_fragment", ".pf_index", ".pf_filter"]
                     .iter()
                     .any(|extension| name.ends_with(extension))
             })
@@ -556,28 +560,38 @@ mod tests {
         (format!("{:x}", hasher.finalize()), files.len())
     }
 
-    /// The meta file, a fragment for each of the five distinct URLs, the word
-    /// index chunk, and the filter.
-    const DECODED_BUNDLE: (&str, usize) = ("67fbefe001a52c4a460f2d81b86e6fc2cd555093", 8);
-
-    #[tokio::test]
-    async fn the_gzipped_files_of_a_bundle_in_memory_decode_to_the_same_payloads() {
+    /// The files of the test pages' bundle, as `get_files` returns them.
+    async fn bundle_in_memory() -> Vec<(String, Vec<u8>)> {
         let mut index = test_index();
         index.add_html_files(test_pages()).await.unwrap();
-        let files = index
+        index
             .get_files()
             .await
             .unwrap()
             .into_iter()
-            .map(|f| (f.filename.to_string_lossy().into_owned(), f.contents))
-            .collect();
-
-        let (digest, count) = decoded_digest(files);
-        assert_eq!((digest.as_str(), count), DECODED_BUNDLE);
+            .map(|f| (file_name(&f.filename), f.contents))
+            .collect()
     }
 
-    #[tokio::test]
-    async fn the_gzipped_files_of_a_bundle_on_disk_decode_to_the_same_payloads() {
+    /// A new, empty folder for a test to write a bundle to.
+    fn empty_folder(test: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("pagefind-{test}-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&folder);
+        folder
+    }
+
+    /// Write the test pages' bundle into `folder`.
+    async fn write_bundle(folder: &std::path::Path) {
+        let mut index = test_index();
+        index.add_html_files(test_pages()).await.unwrap();
+        index
+            .write_files(Some(folder.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+    }
+
+    /// Every file under `folder`, by its path relative to `folder`, in name order.
+    fn read_folder(folder: &std::path::Path) -> Vec<(String, Vec<u8>)> {
         fn read_tree(
             root: &std::path::Path,
             dir: &std::path::Path,
@@ -588,30 +602,98 @@ mod tests {
                 if path.is_dir() {
                     read_tree(root, &path, files);
                 } else {
-                    let name = path
-                        .strip_prefix(root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
+                    let name = file_name(path.strip_prefix(root).unwrap());
                     files.push((name, std::fs::read(&path).unwrap()));
                 }
             }
         }
 
-        let outdir =
-            std::env::temp_dir().join(format!("pagefind-bundle-test-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&outdir);
-        let mut index = test_index();
-        index.add_html_files(test_pages()).await.unwrap();
-        index
-            .write_files(Some(outdir.to_string_lossy().into_owned()))
-            .await
-            .unwrap();
         let mut files = vec![];
-        read_tree(&outdir, &outdir, &mut files);
-        std::fs::remove_dir_all(&outdir).unwrap();
+        read_tree(folder, folder, &mut files);
+        files.sort();
+        files
+    }
 
-        let (digest, count) = decoded_digest(files);
-        assert_eq!((digest.as_str(), count), DECODED_BUNDLE);
+    #[tokio::test]
+    async fn the_gzipped_files_of_a_bundle_decode_to_the_same_payloads() {
+        // A fragment for each of the five distinct URLs, the word index chunk, and the filter.
+        assert_eq!(
+            decoded_digest(&bundle_in_memory().await),
+            ("7249e6f9441c49231b83a1c3f411ef189c3113be".to_string(), 7)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_files_of_a_bundle_in_memory_come_in_a_fixed_order() {
+        let names: Vec<_> = bundle_in_memory()
+            .await
+            .into_iter()
+            .map(|(name, _)| {
+                // The meta file's hash depends on the Pagefind version.
+                if name.ends_with(".pf_meta") {
+                    "pagefind.<hash>.pf_meta".to_string()
+                } else {
+                    name
+                }
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "pagefind.<hash>.pf_meta",
+                "wasm.en.pagefind",
+                "fragment/en_e74aa47.pf_fragment",
+                "fragment/en_62f4888.pf_fragment",
+                "fragment/en_7602e77.pf_fragment",
+                "fragment/en_1b7958a.pf_fragment",
+                "fragment/en_21505e5.pf_fragment",
+                "index/en_3cf6dfe.pf_index",
+                "filter/en_80f54ed.pf_filter",
+                "pagefind.js",
+                "pagefind-highlight.js",
+                "pagefind-worker.js",
+                "pagefind-ui.js",
+                "pagefind-ui.css",
+                "pagefind-modular-ui.js",
+                "pagefind-modular-ui.css",
+                "pagefind-component-ui.js",
+                "pagefind-component-ui.css",
+                "wasm.unknown.pagefind",
+                "pagefind-entry.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bundle_on_disk_is_the_bundle_in_memory() {
+        let folder = empty_folder("bundle-on-disk");
+        write_bundle(&folder).await;
+        let on_disk = read_folder(&folder);
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        let mut in_memory = bundle_in_memory().await;
+        in_memory.sort();
+        assert_eq!(on_disk, in_memory);
+    }
+
+    #[tokio::test]
+    async fn writing_a_bundle_again_keeps_its_hashed_files_and_rewrites_the_others() {
+        let folder = empty_folder("bundle-written-twice");
+        write_bundle(&folder).await;
+        let fragment = read_folder(&folder)
+            .into_iter()
+            .map(|(name, _)| name)
+            .find(|name| name.ends_with(".pf_fragment"))
+            .unwrap();
+        std::fs::write(folder.join(&fragment), b"marker").unwrap();
+        std::fs::write(folder.join("pagefind-ui.css"), b"marker").unwrap();
+
+        write_bundle(&folder).await;
+        let fragment_contents = std::fs::read(folder.join(&fragment)).unwrap();
+        let css_contents = std::fs::read(folder.join("pagefind-ui.css")).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(fragment_contents, b"marker");
+        assert_ne!(css_contents, b"marker");
     }
 }

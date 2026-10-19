@@ -518,3 +518,85 @@ async fn write(file: EncodedFile<'_>) -> Option<SyntheticFile> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        let mut decoded = vec![];
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut decoded)
+            .expect("The contents should be gzipped");
+        decoded
+    }
+
+    fn chunks() -> Vec<&'static [u8]> {
+        vec![b"first", b"second"]
+    }
+
+    #[test]
+    fn a_compressed_file_decodes_to_the_prefix_before_each_chunk() {
+        let file = OutputFile::new(
+            PathBuf::from("a.pf_fragment"),
+            chunks(),
+            Compress::GZ,
+            WriteBehavior::Synthetic,
+        );
+        let Some(EncodedFile {
+            contents: Contents::Compressed(contents),
+            ..
+        }) = file.encode()
+        else {
+            panic!("The file should be compressed");
+        };
+        assert_eq!(gunzip(&contents), b"pagefind_dcdfirstpagefind_dcdsecond");
+    }
+
+    #[test]
+    fn an_uncompressed_file_keeps_its_chunks() {
+        let file = OutputFile::new(
+            PathBuf::from("a.js"),
+            chunks(),
+            Compress::None,
+            WriteBehavior::Synthetic,
+        );
+        let Some(EncodedFile {
+            contents: Contents::Uncompressed(contents),
+            ..
+        }) = file.encode()
+        else {
+            panic!("The file should not be compressed");
+        };
+        assert_eq!(contents, chunks());
+    }
+
+    #[tokio::test]
+    async fn synthetic_files_are_returned_in_the_given_order() {
+        let files = write_all(vec![
+            OutputFile::new(
+                PathBuf::from("b.pf_index"),
+                chunks(),
+                Compress::GZ,
+                WriteBehavior::Synthetic,
+            ),
+            OutputFile::new(
+                PathBuf::from("a.js"),
+                chunks(),
+                Compress::None,
+                WriteBehavior::Synthetic,
+            ),
+        ])
+        .await;
+
+        let files: Vec<_> = files
+            .into_iter()
+            .map(|f| (f.filename, f.contents))
+            .collect();
+        assert_eq!(files[0].0, PathBuf::from("b.pf_index"));
+        assert_eq!(gunzip(&files[0].1), b"pagefind_dcdfirstpagefind_dcdsecond");
+        assert_eq!(files[1], (PathBuf::from("a.js"), b"firstsecond".to_vec()));
+        assert_eq!(files.len(), 2);
+    }
+}
