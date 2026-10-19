@@ -696,4 +696,51 @@ mod tests {
         assert_eq!(fragment_contents, b"marker");
         assert_ne!(css_contents, b"marker");
     }
+
+    #[tokio::test]
+    async fn a_file_added_after_a_directory_replaces_the_page_of_its_url() {
+        let folder = empty_folder("directory");
+        std::fs::create_dir_all(folder.join("alpha")).unwrap();
+        std::fs::write(
+            folder.join("alpha/index.html"),
+            "<html><body><p>Apples from disk.</p></body></html>",
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join("beta.html"),
+            "<html><body><p>Bananas from disk.</p></body></html>",
+        )
+        .unwrap();
+
+        let mut index = test_index();
+        let added = index
+            .add_directory(folder.to_string_lossy().into_owned(), None)
+            .await;
+        std::fs::remove_dir_all(&folder).unwrap();
+        assert_eq!(added.unwrap(), 2);
+
+        index
+            .add_html_file(
+                None,
+                Some("/alpha/index.html".into()),
+                "<html><body><p>Apricots in memory.</p></body></html>".into(),
+            )
+            .await
+            .unwrap();
+
+        let state = index.search_index.lock().await;
+        let mut pages: Vec<_> = state
+            .fossicked_pages
+            .iter()
+            .map(|p| (p.url.as_str(), p.fragment.data.content.as_str()))
+            .collect();
+        pages.sort();
+        assert_eq!(
+            pages,
+            vec![
+                ("/alpha/index.html", "Apricots in memory."),
+                ("/beta.html", "Bananas from disk."),
+            ]
+        );
+    }
 }
