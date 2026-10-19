@@ -9,6 +9,10 @@
 
 ## Unreleased
 
+* Added `PagefindIndex::add_html_files` to the Rust API. It parses a batch of in-memory HTML files in parallel and adds them in order, with the same result as calling `add_html_file` for each file.
+* Adding many files through the Rust API no longer slows down as pages accumulate: an added file now finds an earlier page with the same URL through a map, rather than a scan of every page.
+* Bundle files are now compressed at the default gzip level, in parallel. The bundle is the same size, and is written faster.
+
 ## v1.5.2 (April 12, 2026)
 
 * `v1.5.0` was meant to 2x indexing performance, which it does on macOS and Windows. On Linux, with the published musl build, it actually _halves_ the indexing performance. This release subs in jemalloc on Linux musl builds to fix the musl allocator thrashing, and performance now achieves the 2x `v1.4.0` claim.

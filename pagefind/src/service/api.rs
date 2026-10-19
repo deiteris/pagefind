@@ -63,7 +63,17 @@ impl IndexedFileResponse {
 
 /// An HTML file that isn't on disk, for [`PagefindIndex::add_html_files`].
 /// Either a `source_path` or a `url` must be provided.
+///
+/// # Examples
+///
+/// ```
+/// use pagefind::api::HtmlFile;
+///
+/// let file = HtmlFile::new("<html><body><h1>About</h1></body></html>").with_url("/about/");
+/// assert_eq!(file.url.as_deref(), Some("/about/"));
+/// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HtmlFile {
     /// The source path of the HTML file if it were to exist on disk.
     pub source_path: Option<String>,
@@ -71,6 +81,29 @@ pub struct HtmlFile {
     pub url: Option<String>,
     /// The source HTML content of the file to be parsed.
     pub content: String,
+}
+
+impl HtmlFile {
+    /// Create an HTML file from its source content, with no source path or URL yet.
+    pub fn new(content: impl Into<String>) -> Self {
+        Self {
+            source_path: None,
+            url: None,
+            content: content.into(),
+        }
+    }
+
+    /// Set the source path of the HTML file if it were to exist on disk.
+    pub fn with_source_path(mut self, source_path: impl Into<String>) -> Self {
+        self.source_path = Some(source_path.into());
+        self
+    }
+
+    /// Set an explicit URL to use, instead of having Pagefind compute the URL based on the `source_path`.
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
 }
 
 pub struct PagefindIndex {
@@ -128,11 +161,7 @@ impl PagefindIndex {
         .await
         .map_err(|e| anyhow::anyhow!("Task join error: {e}"))??;
 
-        Ok(IndexedFileResponse {
-            page_word_count: data.fragment.data.word_count as u32,
-            page_url: data.fragment.data.url,
-            page_meta: data.fragment.data.meta,
-        })
+        Ok(IndexedFileResponse::describe(&data))
     }
 
     /// Add a batch of HTML files that aren't on disk into this search index.
@@ -141,9 +170,10 @@ impl PagefindIndex {
     /// for each file in turn. A file whose URL was already added replaces that
     /// page, keeping its original position.
     ///
-    /// The batch is added as a whole: if any file has neither a `source_path`
-    /// nor a `url`, or fails to parse, no file of the batch is added, and the
-    /// error of the first such file in the given order is returned.
+    /// The batch is added as a whole. If any file has neither a `source_path`
+    /// nor a `url`, no file of the batch is added, and the error names the first
+    /// such file in the given order. If any file fails to parse, no file of the
+    /// batch is added either, and an error is returned.
     ///
     /// # Arguments
     /// * `files` - The files to add, each with a source path, a URL, or both.
@@ -226,11 +256,7 @@ impl PagefindIndex {
         .await
         .map_err(|e| anyhow::anyhow!("Task join error: {e}"))??;
 
-        Ok(IndexedFileResponse {
-            page_word_count: data.fragment.data.word_count as u32,
-            page_url: data.fragment.data.url,
-            page_meta: data.fragment.data.meta,
-        })
+        Ok(IndexedFileResponse::describe(&data))
     }
 
     /// Index a directory of HTML files from disk.
@@ -340,11 +366,14 @@ mod tests {
     }
 
     fn html_file(source_path: Option<&str>, url: Option<&str>, content: &str) -> HtmlFile {
-        HtmlFile {
-            source_path: source_path.map(Into::into),
-            url: url.map(Into::into),
-            content: content.into(),
+        let mut file = HtmlFile::new(content);
+        if let Some(source_path) = source_path {
+            file = file.with_source_path(source_path);
         }
+        if let Some(url) = url {
+            file = file.with_url(url);
+        }
+        file
     }
 
     /// Pages with headings, metadata, weights, and filters; `/alpha/` is given twice.
